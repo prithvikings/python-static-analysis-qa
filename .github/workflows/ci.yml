@@ -1,0 +1,10 @@
+name: CI
+
+on:
+  push:
+
+jobs:
+  python-static-analysis:
+    uses: ./.github/workflows/python-static-analysis.yml
+    with:
+      target_dirs: "src"

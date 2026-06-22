@@ -1,0 +1,152 @@
+name: Python Static Analysis
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        description: "Python version to use"
+        required: false
+        type: string
+        default: "3.10"
+      target_dirs:
+        description: "Space-separated directories or files to run analysis on"
+        required: false
+        type: string
+        default: "."
+      ignore_patterns:
+        description: "Space-separated glob patterns to append to Ruff exclusions"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    outputs:
+      analysis_success: ${{ steps.run-analysis.outputs.success }}
+      log_tail: ${{ steps.export-logs.outputs.log_tail }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install Static Analysis Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Run Static Analysis
+        id: run-analysis
+        run: |
+          # Build extend-exclude arguments
+          EXCLUDES=""
+          if [ -n "${{ inputs.ignore_patterns }}" ]; then
+            for pattern in ${{ inputs.ignore_patterns }}; do
+              EXCLUDES="$EXCLUDES --extend-exclude $pattern"
+            done
+          fi
+
+          echo "Running Ruff on ${{ inputs.target_dirs }}..."
+          touch analysis_output.log
+          set -o pipefail
+
+          # Run Ruff and capture output without triggering set -e
+          set +e
+          ruff check ${{ inputs.target_dirs }} $EXCLUDES 2>&1 | tee analysis_output.log
+          RUFF_EXIT=$?
+          set -e
+
+          if [ $RUFF_EXIT -ne 0 ]; then
+            echo "::error::Ruff static analysis found violations"
+            echo "success=false" >> $GITHUB_OUTPUT
+            tail -n 50 analysis_output.log > /tmp/analysis_tail.log
+          else
+            echo "success=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Export logs
+        id: export-logs
+        if: always()
+        run: |
+          if [ -f /tmp/analysis_tail.log ]; then
+            echo "log_tail<<EOF" >> $GITHUB_OUTPUT
+            cat /tmp/analysis_tail.log >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+  collect-results:
+    needs: [static-analysis]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Evaluate status
+        id: evaluate
+        run: |
+          if [[ "${{ needs.static-analysis.result }}" == "failure" ]] || [[ "${{ needs.static-analysis.outputs.analysis_success }}" == "false" ]]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "Python Static Analysis found violations" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "Python Static Analysis passed successfully" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Comment on PR - Failure
+        if: github.event_name == 'pull_request' && steps.evaluate.outputs.status == 'failure'
+        uses: actions/github-script@v7.0.1
+        env:
+          LOG_TAIL: ${{ needs.static-analysis.outputs.log_tail }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const logTail = process.env.LOG_TAIL;
+
+            const body = `## ❌ Python Static Analysis Failed
+
+            Ruff reported violations in the codebase.
+
+            ${logTail ? `<details>
+            <summary>Analysis Logs</summary>
+
+            \`\`\`
+            ${logTail}
+            \`\`\`
+            </details>` : ''}
+
+            [View full analysis logs](${runUrl})
+            `;
+
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+
+      - name: Comment on PR - Success
+        if: github.event_name == 'pull_request' && steps.evaluate.outputs.status == 'success'
+        uses: actions/github-script@v7.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = `## ✅ Python Static Analysis Passed
+
+            No violations found by Ruff.
+
+            [View run details](${runUrl})
+            `;
+
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+
+      - name: Enforce Exit Code
+        if: always()
+        run: |
+          if [ "${{ steps.evaluate.outputs.status }}" == "failure" ]; then
+            echo "::error::Python Static Analysis failed"
+            exit 1
+          fi
