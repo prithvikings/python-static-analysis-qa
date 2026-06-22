@@ -7,4 +7,4 @@ jobs:
   python-static-analysis:
     uses: ./.github/workflows/python-static-analysis.yml
     with:
-      target_dirs: "src"
+      target_dirs: "dir1 dir2"
